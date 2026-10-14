@@ -1,7 +1,7 @@
 {
   "name": "cc-codex-threads",
-  "description": "Run OpenAI Codex CLI from Claude Code as named, resumable worker threads with per-thread model and reasoning effort",
-  "version": "1.2.0",
+  "description": "Run OpenAI Codex CLI from Claude Code as named, resumable worker threads with per-thread model and reasoning effort, live progress, steering and interrupt",
+  "version": "2.0.0",
   "author": { "name": "luck7x", "url": "https://github.com/luck7x" },
   "homepage": "https://github.com/luck7x/cc-codex-threads",
   "repository": "https://github.com/luck7x/cc-codex-threads",

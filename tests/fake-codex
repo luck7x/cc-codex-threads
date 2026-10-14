@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fake `codex` for offline tests. Behaviour is chosen by a MODE:<x> token in
+# Fake `codex` for offline tests. `app-server` runs fake_appserver.py; `exec`
+# is emulated here. Behaviour is chosen by a MODE:<x> token in
 # the prompt (read from stdin), so parallel calls can behave differently.
 #   ok (default) | reconnect | fail | empty | sleep:<sec> | kill | bg | otherid
 # Arguments are checked as strictly as codex-cli 0.162.1 (e.g. resume rejects -s).
@@ -8,7 +9,10 @@ set -uo pipefail
 args=("$@")
 printf '%s\n' "${args[*]}" >> "${FAKE_ARGS_LOG:-/dev/null}"
 
-[[ "${1:-}" == "exec" ]] || { echo "fake codex: only 'exec' is supported" >&2; exit 2; }
+if [[ "${1:-}" == "app-server" && $# -eq 1 ]]; then
+  exec python3 "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/fake_appserver.py"
+fi
+[[ "${1:-}" == "exec" ]] || { echo "fake codex: only 'exec' and 'app-server' are supported" >&2; exit 2; }
 shift
 tid="" out="" is_resume=0
 if [[ "${1:-}" == "resume" ]]; then is_resume=1; tid="$2"; shift 2; fi
@@ -26,6 +30,7 @@ done
 prompt="$(cat)"
 mode="ok"; [[ "$prompt" =~ MODE:([a-z]+(:[0-9]+)?) ]] && mode="${BASH_REMATCH[1]}"
 [[ "$mode" == "otherid" ]] && tid="$(cat /proc/sys/kernel/random/uuid)"
+[[ -n "${FAKE_STORE:-}" ]] && mkdir -p "$FAKE_STORE" && : > "$FAKE_STORE/$tid"  # shared with the fake app-server
 
 echo "{\"type\":\"thread.started\",\"thread_id\":\"$tid\"}"
 echo '{"type":"turn.started"}'
