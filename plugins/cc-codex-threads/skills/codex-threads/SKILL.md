@@ -7,9 +7,8 @@ description: Delegate a well-defined task or a discussion to OpenAI Codex CLI as
 
 Run Codex through one helper script. Never hand-roll `codex exec` commands: the script handles session ids, stdin, timeouts, locking and failure detection.
 
-Script (use the first path that exists):
-- `${CLAUDE_PLUGIN_ROOT}/skills/codex-threads/scripts/codex-thread.sh`
-- `scripts/codex-thread.sh` under this skill's base directory
+Script: `scripts/codex-thread.sh` under this skill's base directory, the absolute path shown when the skill loads. `$CLAUDE_PLUGIN_ROOT` is NOT set in Bash, so do not use it. If the base directory is unknown:
+`T="$(ls -d ~/.claude/plugins/cache/cc-codex-threads/cc-codex-threads/*/skills/codex-threads/scripts/codex-thread.sh | sort -V | tail -1)"`
 
 ## Threads and profiles
 
@@ -25,17 +24,19 @@ The user's CLAUDE.md may define which thread to use when; it takes precedence ov
 ## Commands
 
 ```bash
-T="${CLAUDE_PLUGIN_ROOT}/skills/codex-threads/scripts/codex-thread.sh"
+T="<skill base directory>/scripts/codex-thread.sh"   # absolute path; always quote "$T"
 
-"$T" send luna "<prompt>"                  # resume thread 'luna', or start it from profile 'luna'
-"$T" send sol  <<'EOF'                      # long prompt via stdin (preferred for multi-line)
+"$T" send luna -- "<prompt>"                # resume thread 'luna', or start it from profile 'luna'
+"$T" send sol <<'PROMPT'                    # multi-line prompt via stdin (preferred)
 <prompt>
-EOF
-"$T" send sol --new "<prompt>"             # drop the old session, start fresh
-"$T" send review-x --profile sol "<prompt>"  # extra thread with sol's settings
-"$T" send luna --sandbox read-only --new "<prompt>"  # read-only run (overrides apply to new threads only)
-"$T" list                                  # threads registered for this project
-"$T" reset luna | "$T" reset --all         # forget registrations (Codex history stays on disk)
+PROMPT
+"$T" send sol --new -- "<prompt>"           # drop the old session, start fresh
+"$T" send review-x --profile sol -- "<prompt>"   # extra thread with sol's settings
+"$T" send review-x --profile sol --sandbox read-only --new -- "<prompt>"   # read-only (overrides apply to new threads only)
+"$T" list                                   # threads registered for this project
+"$T" show luna                              # one thread's record
+"$T" reset luna                             # forget one thread (Codex history stays on disk)
+"$T" reset --all                            # forget ALL threads of this project; only when explicitly intended
 ```
 
 Threads are registered per project (git top-level, else the current directory). Run the script from the project directory or pass `--cd <dir>`.
@@ -57,7 +58,7 @@ stdout is Codex's final reply, then a line starting with `[cct]` that has the th
 |---|---|---|
 | 0 | ok | verify the work |
 | 2 | usage error (bad flag, unknown profile, empty prompt) | fix the call |
-| 3 | thread busy | wait for it, or use another thread name |
-| 4 | Codex failed | read the message and log; if a resume failed because the session is gone, use `--new` |
+| 3 | busy: thread already running, or a reset while threads run | wait for it, or use another thread name |
+| 4 | Codex failed, or a local state problem (corrupt registry, missing cwd) | read the message and log; if the session or its directory is gone, use `--new` |
 | 5 | timeout | split the task or raise `--timeout` |
 | 6 | empty reply | inspect the log; resume with a clearer prompt |

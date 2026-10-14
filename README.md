@@ -9,12 +9,16 @@ A Claude Code plugin that runs [OpenAI Codex CLI](https://github.com/openai/code
 - **Resume by session id, not "last".** Every thread name maps to its own Codex session id, so `luna` and `sol` never steal each other's context.
 - **Any model / reasoning effort**, including `max`, via profiles.
 - **Built on `codex exec`**, Codex's stable non-interactive CLI, with no app-server or daemon.
-- **Hardened wrapper:** stdin is always closed (no silent hangs), per-effort timeouts, per-thread locks, transient reconnects are tolerated, and failed/empty turns produce clear exit codes.
+- **Hardened wrapper:** stdin is always closed (no silent hangs), per-effort timeouts, per-thread and per-project locks, atomic registry writes, transient reconnects are tolerated, and failed/empty turns produce clear exit codes.
 - **No build step.** It is one Bash script plus a skill file.
 
 ## Requirements
 
-`codex` (logged in), `jq`, `flock`, `timeout` (util-linux / coreutils), Bash 4+.
+`codex` (logged in), `jq`, `flock` (util-linux), GNU `timeout` (coreutils), `sha1sum` or `shasum`, and Bash 4+. Tested on Linux. On macOS, install `flock` and `coreutils` with Homebrew first.
+
+## Tests
+
+`tests/run.sh` runs an offline suite against a fake `codex`, so it makes no API calls.
 
 ## Install
 
@@ -28,11 +32,11 @@ claude plugin install cc-codex-threads@cc-codex-threads
 Claude uses it through the `codex-threads` skill. You can also run it directly:
 
 ```bash
-T=~/.claude/plugins/cache/cc-codex-threads/cc-codex-threads/*/skills/codex-threads/scripts/codex-thread.sh
-$T send luna "Add a --verbose flag to cli.py; run pytest; reply with a summary"
-$T send luna "Also update README"          # resumes the same luna session
-$T send sol  "Review the approach in docs/plan.md and list risks"
-$T list
+T="$(ls -d ~/.claude/plugins/cache/cc-codex-threads/cc-codex-threads/*/skills/codex-threads/scripts/codex-thread.sh | sort -V | tail -1)"
+"$T" send luna -- "Add a --verbose flag to cli.py; run pytest; reply with a summary"
+"$T" send luna -- "Also update README"     # resumes the same luna session
+"$T" send sol  -- "Review the approach in docs/plan.md and list risks"
+"$T" list
 ```
 
 Run `codex-thread.sh help` to see all commands and exit codes.
