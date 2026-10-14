@@ -29,13 +29,28 @@ claude plugin install cc-codex-threads@cc-codex-threads
 
 ## Usage
 
-Claude uses it through the `codex-threads` skill. You can also run it directly:
+Claude delegates through two relay subagents: `codex-luna` and `codex-sol`. In the agent view you can see the exact prompt sent to Codex, its live progress (commands, file edits and reasoning steps), and the verbatim reply. Messages you send to that agent continue the same Codex session. The relay itself runs on Haiku at low effort and only forwards text.
+
+Example progress stream:
+
+```
+● session 01a139a8-…
+💬 I'll review the rewrite read-only and check lock ordering…
+$ nl -ba plugins/…/codex-thread.sh
+⚠ Reconnecting... 1/5 (stream disconnected before completion)
+💭 Reviewing registry validation and jq behavior
+✎ update src/cli.py
+✓ done (in=… out=… reasoning=…)
+```
+
+You can also run the script directly:
 
 ```bash
 T="$(ls -d ~/.claude/plugins/cache/cc-codex-threads/cc-codex-threads/*/skills/codex-threads/scripts/codex-thread.sh | sort -V | tail -1)"
 "$T" send luna -- "Add a --verbose flag to cli.py; run pytest; reply with a summary"
 "$T" send luna -- "Also update README"     # resumes the same luna session
 "$T" send sol  -- "Review the approach in docs/plan.md and list risks"
+"$T" watch luna                            # follow a running thread live
 "$T" list
 ```
 

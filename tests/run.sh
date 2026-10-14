@@ -104,5 +104,15 @@ printf '%s\n' "$good" > "$f"; run send luna -- "MODE:otherid"; expect_rc 4 "resu
 run reset --all;                                expect_rc 0 "reset --all recovers"
 run list;                                       expect_rc 0 "list after recovery"
 
+echo "watch"
+"$T" send w1 --profile luna -- "MODE:sleep:2" >/dev/null 2>&1 &
+W="$(timeout 30 "$T" watch w1 --wait 10)"; RC=$?; wait
+expect_rc 0 "watch follows a live run and exits when it ends"
+[[ "$W" == *"● session"* && "$W" == *"✓ done"* && "$W" == *"run ended"* ]] && ok "watch renders progress" || bad "watch renders progress" "$W"
+W="$(timeout 30 "$T" watch w1 --wait 0)"; RC=$?
+expect_rc 0 "watch replays the last run"
+[[ "$W" == *"✓ done"* ]] && ok "replay shows completion" || bad "replay shows completion" "$W"
+run watch nothere --wait 0;                     expect_rc 2 "watch of unknown thread -> 2"
+
 echo; echo "passed=$pass failed=$fail"
 ((fail == 0))

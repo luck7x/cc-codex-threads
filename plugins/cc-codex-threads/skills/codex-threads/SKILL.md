@@ -21,6 +21,12 @@ A thread is a name you choose; a profile is the model/effort/sandbox it starts w
 
 The user's CLAUDE.md may define which thread to use when; it takes precedence over this table.
 
+## Preferred: dispatch through the relay agents
+
+For delegation, use the Agent tool with `subagent_type: "cc-codex-threads:codex-luna"` or `"cc-codex-threads:codex-sol"` instead of running the script yourself. The user then sees the exact prompt, Codex's live progress (commands, edits and reasoning steps streamed through Monitor) and the verbatim reply, and can continue the conversation with that agent. The agent's prompt is the task text that is forwarded to Codex unchanged, so write it as a complete, self-contained Codex prompt (see Rules 2). For follow-ups, send to the same agent with SendMessage; it resumes the same Codex session. Optional first line `@cct thread=<name> [new] [read-only] [cd=<abs dir>]` picks another thread or starts fresh. Use `run_in_background: true` for long runs.
+
+Run the script directly (below) only for `list`, `show`, `reset`, `watch`, or when the Agent tool is unavailable.
+
 ## Commands
 
 ```bash
@@ -35,6 +41,7 @@ PROMPT
 "$T" send review-x --profile sol --sandbox read-only --new -- "<prompt>"   # read-only (overrides apply to new threads only)
 "$T" list                                   # threads registered for this project
 "$T" show luna                              # one thread's record
+"$T" watch luna                             # live progress of luna's current run (exits when it ends); use with Monitor
 "$T" reset luna                             # forget one thread (Codex history stays on disk)
 "$T" reset --all                            # forget ALL threads of this project; only when explicitly intended
 ```

@@ -15,7 +15,7 @@
 # Usage: codex-thread.sh help
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 STATE_DIR="${CCT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cc-codex-threads}"
 USER_PROFILES="${CCT_PROFILES:-${XDG_CONFIG_HOME:-$HOME/.config}/cc-codex-threads/profiles.json}"
@@ -46,6 +46,12 @@ COMMANDS
         --timeout <sec>    hard timeout, > 0 (default depends on effort)
   list   [--cd <dir>]                 threads registered for this project
   show   <thread> [--cd <dir>]        one thread's record
+  watch  <thread> [--wait <sec>] [--cd <dir>]
+                                      live progress of the thread's current run
+                                      (one line per command/edit/reasoning step);
+                                      exits when the run ends. Without a live run
+                                      (after waiting --wait, default 15s), prints
+                                      the last run's progress.
   reset  <thread> [--cd <dir>]        forget one thread (Codex history kept)
   reset  --all [--cd <dir>]           forget all threads of this project
   profiles                            show effective profiles
@@ -100,6 +106,41 @@ save_registry() {
   mkdir -p -- "$(dirname -- "$f")" || return 4
   tmp="$(mktemp "$f.XXXXXX")" || return 4
   if ! printf '%s\n' "$json" > "$tmp" || ! mv -f -- "$tmp" "$f"; then rm -f -- "$tmp"; return 4; fi
+}
+
+# A run is live if its wrapper pid exists and is really this script (pid reuse).
+live_run_pid() {
+  [[ "$1" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null || return 1
+  [[ ! -r "/proc/$1/cmdline" ]] || tr '\0' ' ' < "/proc/$1/cmdline" | grep -q 'codex-thread'
+}
+
+run_pointer() { printf '%s/runs/%s-%s.json' "$STATE_DIR" "$(basename -- "$1" .json)" "$2"; }
+
+# Render Codex JSONL events (stdin) as one human-readable progress line each.
+render_progress() {
+  jq --unbuffered -rR '
+    fromjson? // empty
+    | def short(n): gsub("[\r\n\t]+"; " ") | if length > n then .[0:n] + "…" else . end;
+      if .type == "thread.started" then "● session \(.thread_id)"
+      elif .type == "turn.started" then "● working…"
+      elif .type == "error" then "⚠ \(.message | short(160))"
+      elif .type == "turn.completed" then "✓ done (in=\(.usage.input_tokens) out=\(.usage.output_tokens) reasoning=\(.usage.reasoning_output_tokens))"
+      elif .type == "turn.failed" then "✗ failed: \(.error.message // "unknown" | short(200))"
+      elif .type == "item.started" and .item.type == "command_execution" then
+        "$ \(.item.command | sub("^/bin/(ba)?sh -l?c .(?<c>.*).$"; "\(.c)") | short(160))"
+      elif .type == "item.completed" then
+        (.item as $i
+         | if $i.type == "command_execution" then
+             (if ($i.exit_code // 0) != 0 then "  ↳ exit \($i.exit_code)" else empty end)
+           elif $i.type == "reasoning" then
+             ([$i.text | scan("\\*\\*([^*]+)\\*\\*") | .[0]] | if length > 0 then "💭 " + (.[0:2] | join(" / ") | short(160)) else empty end)
+           elif $i.type == "file_change" then
+             "✎ " + ([$i.changes[]? | "\(.kind // "edit") \(.path)"] | join(", ") | short(200))
+           elif $i.type == "mcp_tool_call" then "⚙ \($i.server // "mcp").\($i.tool // "?")"
+           elif $i.type == "web_search" then "🔎 \($i.query // "" | short(120))"
+           elif $i.type == "agent_message" then "💬 \($i.text | short(240))"
+           else empty end)
+      else empty end'
 }
 
 lock_paths() {  # sets GATE_LOCK REG_LOCK for a registry file
@@ -237,6 +278,12 @@ cmd_send() {
     cmd=(codex exec "${common[@]}" -s "$sandbox" -)
   fi
 
+  # Pointer for `watch`: which log belongs to the current (or last) run.
+  local run_file; run_file="$(run_pointer "$reg_file" "$thread")"
+  save_registry "$run_file" "$(jq -n --argjson pid $$ --arg log "$log" --arg mode "$mode" \
+    --arg m "$model" --arg e "$effort" '{pid:$pid, log:$log, mode:$mode, model:$m, effort:$e}')" \
+    || die 4 "cannot write run pointer $run_file"
+
   local t0 rc; t0="$(date +%s)"
   # At the deadline, timeout SIGKILLs the whole process group (Codex's launcher
   # and its native child). Only that KILL message counts as a timeout.
@@ -315,6 +362,44 @@ cmd_show() {
   jq --arg t "$thread" -e '.threads[$t]' <<<"$reg" || die 2 "no thread '$thread' in $root"
 }
 
+cmd_watch() {
+  local thread="${1:-}"; (($#)) && shift
+  [[ -n "$thread" && "$thread" != -* ]] || die 2 "watch: missing <thread>"
+  valid_name "$thread"
+  local wait=15
+  local -a rest=()
+  while (($#)); do
+    case "$1" in
+      --wait) (($# >= 2)) && [[ "$2" =~ ^[0-9]+$ ]] || die 2 "--wait requires seconds"; wait="$2"; shift 2 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  parse_cd_only "${rest[@]}"
+  local root f run pid log deadline
+  root="$(project_root "$DIR")" || die 4 "cannot resolve project root"
+  f="$(registry_file "$root")" || die 4 "cannot compute registry path"
+  run="$(run_pointer "$f" "$thread")"
+  # `send` is usually started in the background just before `watch`: give it
+  # up to --wait seconds to publish a live run before falling back to the last one.
+  deadline=$(( $(date +%s) + wait ))
+  while :; do
+    if [[ -s "$run" ]]; then
+      pid="$(jq -r '.pid' "$run" 2>/dev/null)"; log="$(jq -r '.log' "$run" 2>/dev/null)"
+      live_run_pid "$pid" && break
+    fi
+    (( $(date +%s) >= deadline )) && break
+    sleep 0.3
+  done
+  [[ -n "${log:-}" && "$log" != null ]] || die 2 "no run recorded for thread '$thread' in $root"
+  echo "[cct] watching thread=$thread $(jq -r '"\(.mode) \(.model)/\(.effort)"' "$run")"
+  if live_run_pid "$pid"; then
+    tail -n +1 -F --pid="$pid" -- "$log" 2>/dev/null | render_progress
+  else
+    render_progress < "$log"
+  fi
+  echo "[cct] run ended"
+}
+
 cmd_reset() {
   local target="${1:-}"; (($#)) && shift
   [[ -n "$target" ]] || die 2 "reset: missing <thread> or --all"
@@ -340,6 +425,7 @@ case "${1:-help}" in
   send)     shift; cmd_send "$@" ;;
   list)     shift; cmd_list "$@" ;;
   show)     shift; cmd_show "$@" ;;
+  watch)    shift; cmd_watch "$@" ;;
   reset)    shift; cmd_reset "$@" ;;
   profiles) p="$(profiles_json)" || die 2 "invalid profiles JSON"; jq . <<<"$p" ;;
   version|--version) echo "cc-codex-threads $VERSION" ;;
