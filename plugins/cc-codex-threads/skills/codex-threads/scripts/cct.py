@@ -90,7 +90,7 @@ COMMANDS
   reset  <thread> | --all [--cd <dir>]
                                       forget threads (Codex history is kept)
   profiles                            show effective profiles
-  relay-init <profile> | relay <state> | relay-result <state>
+  relay-init <profile> | relay-next <state> | relay <state> <msg> | relay-result <state>
                                       used by the relay subagents
   help | version
 
@@ -347,12 +347,19 @@ def default_timeout(effort):
 
 # ---------------------------------------------------------------- runs
 
+HAVE_PROC = os.path.isdir("/proc/self")
+
+
 def proc_start_time(pid):
-    """Kernel start time of a process (Linux), '' if unknown, None if not running."""
+    """Kernel start time of a live process. Returns '' where /proc is not
+    available (identity unknown) and None if the process is gone or a zombie."""
+    if not HAVE_PROC:
+        return ""
     try:
         with open("/proc/%d/stat" % pid) as f:
             stat = f.read()
-        return stat[stat.rindex(")") + 2:].split()[19]
+        fields = stat[stat.rindex(")") + 2:].split()
+        return None if fields[0] in ("Z", "X") else fields[19]
     except FileNotFoundError:
         return None
     except (OSError, ValueError, IndexError):
@@ -550,7 +557,10 @@ def reply(conn, obj):
 
 
 def control_request(rec, op, text=None, wait=60):
-    """Send one command to a live run. Returns the runner's reply dict."""
+    """Send one command to a live run. Returns the runner's reply dict.
+
+    outcome: delivered / interrupt_sent / ... on success; not_running when the
+    run has certainly ended; unknown when the result cannot be known."""
     req = {"op": op, "request_id": uuid.uuid4().hex, "run_id": rec["run_id"]}
     if text is not None:
         req["text"] = text
@@ -560,7 +570,9 @@ def control_request(rec, op, text=None, wait=60):
         s.connect(rec["socket"])
     except OSError as e:
         s.close()
-        return {"ok": False, "outcome": "not_running", "error": "cannot connect to run %s: %s" % (rec["run_id"], e)}
+        if not run_alive(load_run(rec["run_id"])):
+            return {"ok": False, "outcome": "not_running", "error": "run %s has ended" % rec["run_id"]}
+        return {"ok": False, "outcome": "unknown", "error": "cannot reach run %s: %s" % (rec["run_id"], e)}
     try:
         s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
         buf = b""
@@ -580,37 +592,60 @@ def control_request(rec, op, text=None, wait=60):
 
 # ---------------------------------------------------------------- engines
 
-def _parent_death_signal():
-    try:
-        os.setpgid(0, 0)
-    except OSError:
-        pass
-    if sys.platform.startswith("linux"):
-        try:
-            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
-        except Exception:
-            pass
+try:
+    _LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
+except OSError:
+    _LIBC = None
+
+
+def _child_setup():
+    # Runs between fork and exec. cmd_send spawns the child before it starts
+    # any thread, and this only makes one libc call (loaded beforehand).
+    if _LIBC is not None:
+        _LIBC.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
 
 
 class Child(object):
-    """A codex process in its own process group, with stdout lines fed to inbox."""
+    """A codex process in its own session/process group.
+
+    stdout lines go to the inbox; stdin is written only by a dedicated writer
+    thread, so a child that stops reading cannot block the runner's loop."""
 
     def __init__(self, argv, cwd, inbox, stderr_path, stdin_data=None):
         self.inbox = inbox
         self.err = open(stderr_path, "ab")
-        self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.err, preexec_fn=_parent_death_signal, close_fds=True)
-        self.lock = threading.Lock()
-        if stdin_data is not None:
-            threading.Thread(target=self._feed, args=(stdin_data,), daemon=True).start()
-        threading.Thread(target=self._pump, daemon=True).start()
-
-    def _feed(self, data):
         try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.close()
+            self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=self.err, start_new_session=True, preexec_fn=_child_setup,
+                                         close_fds=True)
+        except OSError as e:
+            self.err.close()
+            die(FAILED, "cannot start %s: %s" % (argv[0], e))
+        self.start_time = proc_start_time(self.proc.pid) or ""
+        self.outq = queue.Queue()
+        self.writer_dead = False
+        threading.Thread(target=self._writer, daemon=True).start()
+        threading.Thread(target=self._pump, daemon=True).start()
+        if stdin_data is not None:
+            self.outq.put(stdin_data)
+            self.outq.put(None)
+
+    def _writer(self):
+        try:
+            while True:
+                data = self.outq.get()
+                if data is None:
+                    break
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
         except (OSError, ValueError):
             pass
+        finally:
+            self.writer_dead = True
+            try:
+                self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
 
     def _pump(self):
         for line in self.proc.stdout:
@@ -618,13 +653,9 @@ class Child(object):
         self.inbox.put(("eof", None))
 
     def write(self, obj):
-        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-        with self.lock:
-            try:
-                self.proc.stdin.write(data)
-                self.proc.stdin.flush()
-            except ValueError:
-                raise OSError("app-server stdin is closed")
+        if self.writer_dead:
+            raise OSError("app-server stdin is closed")
+        self.outq.put((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
 
     def signal_group(self, sig):
         try:
@@ -633,10 +664,8 @@ class Child(object):
             pass
 
     def stop(self, grace=5.0):
-        try:
-            self.proc.stdin.close()
-        except (OSError, ValueError):
-            pass
+        """EOF first (app-server exits on it), then TERM, then KILL the group."""
+        self.outq.put(None)
         for sig, wait in ((None, grace), (signal.SIGTERM, 3.0), (signal.SIGKILL, 3.0)):
             if sig is not None:
                 self.signal_group(sig)
@@ -645,12 +674,39 @@ class Child(object):
                 break
             except subprocess.TimeoutExpired:
                 continue
-        if self.proc.poll() is not None:
-            self.signal_group(signal.SIGKILL)  # stragglers left in the group
+        self.signal_group(signal.SIGKILL)   # stragglers left in the group
         try:
             self.err.close()
         except OSError:
             pass
+
+
+def reap_previous(project, thread):
+    """A runner killed with SIGKILL releases the thread lock at once, while its
+    worker may take a moment to exit. Never let two workers share a thread."""
+    prev = current_run(project, thread)
+    pid, start = (prev or {}).get("worker_pid"), (prev or {}).get("worker_start")
+    if not pid_alive(pid, start):
+        return
+    wait = int(os.environ.get("CCT_REAP_WAIT", "10"))
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        time.sleep(0.2)
+        if not pid_alive(pid, start):
+            return
+    if not start:   # cannot prove the pid is still ours: never signal it
+        die(BUSY, "the previous worker of thread '%s' (pid %s) is still running; retry later" % (thread, pid))
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            pass
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            if not pid_alive(pid, start):
+                return
+            time.sleep(0.2)
+    die(BUSY, "the previous worker of thread '%s' (pid %s) does not exit" % (thread, pid))
 
 
 class Rejected(Exception):
@@ -678,6 +734,9 @@ def server_request_reply(method, params):
     return None, "unsupported server request %s" % method
 
 
+TERMINAL = ("completed", "interrupted", "failed")
+
+
 class AppServerRun(object):
     """Drives one turn through a private `codex app-server`."""
 
@@ -691,14 +750,22 @@ class AppServerRun(object):
         self.thread_id = None
         self.turn_id = None
         self.turn_done = None      # final Turn object
-        self.agent_msgs = []       # (item id, phase, text) for our turn
-        self.last_usage = None
-        self.base_usage = {}       # thread totals reported before our turn started
+        self.early_done = {}       # turn id -> Turn that completed before turn/start answered
+        self.messages = {}         # agentMessage item id -> [order, phase, text]
+        self.deltas = {}           # item id -> [order, text] for messages never completed
+        self.order = 0
+        self.usage_log = []        # (turn id, tokenUsage) in arrival order
         self.retries = 0
         self.last_error = ""
-        self.queued_steers = []    # (req, conn) received before the turn started
+        self.queued_steers = []    # (text, conn) received before the turn id was known
+        self.failed_steers = []    # (conn, error, time): answered once the turn's fate is known
         self.interrupt_sent = False
+        self.violation = None
         self.eof = False
+
+    def spawn(self):
+        self.child = Child([CODEX, "app-server"], self.ctx.cwd, self.inbox, self.ctx.stderr_path)
+        return self.child
 
     # -- transport
     def request(self, method, params, callback=None):
@@ -709,17 +776,20 @@ class AppServerRun(object):
         return rid
 
     def call(self, method, params, timeout):
+        c = self.ctx
         rid = self.request(method, params)
-        deadline = time.monotonic() + timeout
+        own_deadline = time.monotonic() + timeout
         while rid not in self.responses:
             if self.eof:
-                die(FAILED, "codex app-server exited during %s: %s" % (method, tail_text(self.ctx.stderr_path)))
-            if time.monotonic() >= deadline:
+                die(FAILED, "codex app-server exited during %s: %s" % (method, tail_text(c.stderr_path)))
+            if c.stop_reason is None and time.monotonic() >= c.deadline:
+                c.stop_reason = "timeout"
+            if c.stop_reason:
+                die(TIMEOUT if c.stop_reason == "timeout" else INTERRUPTED,
+                    "stopped during %s (%s)" % (method, c.stop_reason))
+            if time.monotonic() >= own_deadline:
                 die(FAILED, "codex app-server did not answer %s within %ds" % (method, timeout))
-            if self.ctx.stop_reason:
-                die(TIMEOUT if self.ctx.stop_reason == "timeout" else INTERRUPTED,
-                    "stopped during %s (%s)" % (method, self.ctx.stop_reason))
-            self.step(min(0.5, max(0.05, deadline - time.monotonic())))
+            self.step(0.25)
         msg = self.responses.pop(rid)
         if "error" in msg:
             err = msg.get("error") or {}
@@ -769,14 +839,31 @@ class AppServerRun(object):
         elif method is not None:
             self.notify(method, msg.get("params") or {})
 
-    def ours(self, params):
-        tid = params.get("threadId")
-        turn = params.get("turnId")
-        return (tid is None or tid == self.thread_id) and (turn is None or self.turn_id is None or turn == self.turn_id)
+    # -- notifications
+    def next_order(self):
+        self.order += 1
+        return self.order
 
     def notify(self, method, p):
         out = self.ctx.progress
-        if not self.ours(p):
+        tid = p.get("threadId")
+        if tid is not None and self.thread_id is not None and tid != self.thread_id:
+            return
+        if method == "thread/tokenUsage/updated":
+            self.usage_log.append((p.get("turnId"), p.get("tokenUsage") or {}))
+            return
+        if method == "turn/completed":
+            turn = p.get("turn") or {}
+            if self.turn_id is None:
+                self.early_done[turn.get("id")] = turn
+            elif turn.get("id") == self.turn_id:
+                self.set_done(turn)
+            return
+        if method == "thread/settings/updated":
+            self.check_live_settings(p.get("threadSettings") or {})
+            return
+        turn = p.get("turnId")
+        if turn is not None and self.turn_id is not None and turn != self.turn_id:
             return
         if method == "turn/started":
             out("● turn started")
@@ -786,6 +873,10 @@ class AppServerRun(object):
                 out("$ %s" % short(strip_shell(item.get("command")), 160))
         elif method == "item/completed":
             self.item_completed(p.get("item") or {})
+        elif method == "item/agentMessage/delta":
+            iid = p.get("itemId")
+            if isinstance(iid, str) and isinstance(p.get("delta"), str):
+                self.deltas.setdefault(iid, [self.next_order(), ""])[1] += p["delta"]
         elif method == "error":
             err = p.get("error") or {}
             text = short(err.get("message") or "error", 200)
@@ -795,20 +886,22 @@ class AppServerRun(object):
             else:
                 self.last_error = err.get("message") or "error"
                 out("⚠ %s" % text)
-        elif method == "thread/tokenUsage/updated":
-            usage = p.get("tokenUsage") or {}
-            if self.turn_id is None:  # totals before our turn = baseline
-                self.base_usage = usage.get("total") or {}
-            else:
-                self.last_usage = usage
-        elif method == "turn/completed":
-            turn = p.get("turn") or {}
-            if self.turn_id is not None and turn.get("id") == self.turn_id:
-                self.turn_done = turn
         elif method == "thread/compacted":
             out("… context compacted")
         elif method == "model/rerouted":
             out("⚠ model rerouted: %s" % short(json.dumps(p, ensure_ascii=False), 200))
+
+    def add_message(self, item):
+        iid = item.get("id") or "anon-%d" % self.next_order()
+        text = item.get("text") if isinstance(item.get("text"), str) else ""
+        if iid in self.messages:
+            entry = self.messages[iid]
+            entry[1] = item.get("phase") or entry[1]
+            if text:
+                entry[2] = text
+        else:
+            self.messages[iid] = [self.next_order(), item.get("phase"), text]
+        return text
 
     def item_completed(self, item):
         out = self.ctx.progress
@@ -832,56 +925,96 @@ class AppServerRun(object):
         elif t == "webSearch":
             out("🔎 %s" % short(item.get("query") or "", 120))
         elif t == "agentMessage":
-            text = item.get("text") or ""
-            self.agent_msgs.append((item.get("id"), item.get("phase"), text))
+            text = self.add_message(item)
             if item.get("phase") != "final_answer":
                 out("💬 %s" % short(text, 240))
         elif t == "contextCompaction":
             out("… context compacted")
 
+    def set_done(self, turn):
+        self.turn_done = turn
+        for item in turn.get("items") or []:
+            if isinstance(item, dict) and item.get("type") == "agentMessage":
+                self.add_message(item)
+        for conn, err, _ in self.failed_steers:
+            reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn ended first (%s)" % err})
+        self.failed_steers = []
+
+    def check_live_settings(self, ts):
+        c = self.ctx
+        problems = []
+        if ts.get("model") not in (None, c.model):
+            problems.append("model %s" % ts.get("model"))
+        sb = (ts.get("sandboxPolicy") or {}).get("type")
+        if sb is not None and sb != SANDBOX_TYPES[c.sandbox]:
+            problems.append("sandbox %s" % sb)
+        if ts.get("approvalPolicy") not in (None, "never"):
+            problems.append("approval policy %s" % ts.get("approvalPolicy"))
+        if ts.get("approvalsReviewer") not in (None, "user"):
+            problems.append("approvals reviewer %s" % ts.get("approvalsReviewer"))
+        if problems and self.violation is None:
+            self.violation = "codex changed the thread settings mid-run (%s); stopped" % ", ".join(problems)
+            c.progress("⚠ " + self.violation)
+            c.stop_reason = c.stop_reason or "violation"
+        if self.turn_id is not None and ts.get("effort") not in (None, c.effort):
+            c.progress("⚠ codex reports effort %s (requested %s)" % (ts.get("effort"), c.effort))
+
     # -- control commands from steer/interrupt/status clients
     def control(self, req, conn):
+        c = self.ctx
         op = req.get("op")
-        if req.get("run_id") != self.ctx.run_id:
-            return reply(conn, {"ok": False, "outcome": "rejected", "error": "this socket serves run %s" % self.ctx.run_id})
+        if req.get("run_id") != c.run_id:
+            return reply(conn, {"ok": False, "outcome": "rejected", "error": "this socket serves run %s" % c.run_id})
         if op == "status":
-            return reply(conn, {"ok": True, "outcome": "status", "state": self.ctx.state,
+            return reply(conn, {"ok": True, "outcome": "status", "state": c.state,
                                 "thread_id": self.thread_id, "turn_id": self.turn_id})
-        if self.turn_done is not None or self.ctx.stop_reason:
-            return reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn has already ended"})
+        if op not in ("steer", "interrupt"):
+            return reply(conn, {"ok": False, "outcome": "rejected", "error": "unknown op %r" % op})
+        if self.turn_done is not None or c.stop_reason:
+            return reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn has ended or is stopping"})
         if op == "steer":
             text = req.get("text")
             if not isinstance(text, str) or not text.strip():
                 return reply(conn, {"ok": False, "outcome": "rejected", "error": "empty steer text"})
             if self.turn_id is None:
-                self.queued_steers.append((req, conn))
+                self.queued_steers.append((text, conn))
                 return None
             return self.send_steer(text, conn)
-        if op == "interrupt":
-            if self.turn_id is None:
-                self.ctx.stop_reason = "interrupt"
-                self.ctx.progress("■ interrupt requested before the turn started")
-                return reply(conn, {"ok": True, "outcome": "interrupted"})
-            self.ctx.user_interrupt = True
-            self.send_interrupt(conn)
-            return None
-        return reply(conn, {"ok": False, "outcome": "rejected", "error": "unknown op %r" % op})
+        c.user_interrupt = True
+        c.stop_reason = "interrupt"
+        if self.turn_id is None:
+            c.progress("■ interrupt requested before the turn started")
+            return reply(conn, {"ok": True, "outcome": "interrupted"})
+        return self.send_interrupt(conn)
 
     def send_steer(self, text, conn):
         self.ctx.progress("↪ steer: %s" % short(text, 200))
 
         def done(msg):
-            if "error" in msg:
-                err = (msg.get("error") or {}).get("message") or "rejected"
-                self.ctx.progress("⚠ steer rejected: %s" % short(err, 200))
-                reply(conn, {"ok": False, "outcome": "rejected", "error": err})
-            else:
-                reply(conn, {"ok": True, "outcome": "delivered", "turn_id": (msg.get("result") or {}).get("turnId")})
+            if "error" not in msg:
+                return reply(conn, {"ok": True, "outcome": "delivered", "turn_id": (msg.get("result") or {}).get("turnId")})
+            err = (msg.get("error") or {}).get("message") or "rejected"
+            if self.turn_done is not None:
+                return reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn ended first (%s)" % err})
+            # The rejection may be a turn that is just ending: decide once its
+            # fate is known (set_done), or report it as rejected after a moment.
+            self.failed_steers.append((conn, err, time.monotonic()))
         try:
             self.request("turn/steer", {"threadId": self.thread_id, "expectedTurnId": self.turn_id,
                                         "input": [{"type": "text", "text": text}]}, done)
         except OSError as e:
             reply(conn, {"ok": False, "outcome": "unknown", "error": "app-server pipe closed: %s" % e})
+
+    def expire_failed_steers(self):
+        now = time.monotonic()
+        keep = []
+        for conn, err, when in self.failed_steers:
+            if now - when >= 3:
+                self.ctx.progress("⚠ steer rejected: %s" % short(err, 200))
+                reply(conn, {"ok": False, "outcome": "rejected", "error": err})
+            else:
+                keep.append((conn, err, when))
+        self.failed_steers = keep
 
     def send_interrupt(self, conn=None):
         if self.interrupt_sent:
@@ -911,25 +1044,32 @@ class AppServerRun(object):
                 "approvalPolicy": "never", "approvalsReviewer": "user"}
 
     def check_settings(self, res, expect_id):
+        """Fail closed: the server must confirm exactly the settings we asked for."""
         c = self.ctx
         got_id = (res.get("thread") or {}).get("id")
         if not isinstance(got_id, str) or not UUID_RE.match(got_id):
             die(FAILED, "codex did not report a valid thread id")
         if expect_id and got_id.lower() != expect_id.lower():
             die(FAILED, "codex resumed a different thread (%s, expected %s)" % (got_id, expect_id))
-        if res.get("model") not in (None, c.model):
-            die(FAILED, "codex applied model %s instead of %s; not running the turn" % (res.get("model"), c.model))
+        problems = []
+        if res.get("model") != c.model:
+            problems.append("model %r instead of %s" % (res.get("model"), c.model))
         sb = (res.get("sandbox") or {}).get("type")
-        if sb is not None and sb != SANDBOX_TYPES[c.sandbox]:
-            die(FAILED, "codex applied sandbox %s instead of %s; not running the turn" % (sb, c.sandbox))
-        if res.get("approvalPolicy") not in (None, "never"):
-            die(FAILED, "codex applied approval policy %r instead of never" % res.get("approvalPolicy"))
+        if sb != SANDBOX_TYPES[c.sandbox]:
+            problems.append("sandbox %r instead of %s" % (sb, c.sandbox))
+        if res.get("approvalPolicy") != "never":
+            problems.append("approval policy %r instead of never" % (res.get("approvalPolicy"),))
+        if res.get("approvalsReviewer") != "user":
+            problems.append("approvals reviewer %r instead of user" % (res.get("approvalsReviewer"),))
+        cwd = res.get("cwd")
+        if not isinstance(cwd, str) or os.path.realpath(cwd) != os.path.realpath(c.cwd):
+            problems.append("cwd %r instead of %s" % (cwd, c.cwd))
+        if problems:
+            die(FAILED, "codex applied different settings (%s); no turn was started" % "; ".join(problems))
         return got_id
 
     def run(self):
         c = self.ctx
-        self.child = Child([CODEX, "app-server"], c.cwd, self.inbox, c.stderr_path)
-        c.on_child(self.child)
         try:
             self.call("initialize", {"clientInfo": {"name": "cc-codex-threads", "title": "cc-codex-threads",
                                                     "version": VERSION}}, 60)
@@ -953,17 +1093,28 @@ class AppServerRun(object):
             if not isinstance(self.turn_id, str) or not self.turn_id:
                 die(FAILED, "codex did not report a turn id")
             c.started_turn(self.thread_id, self.turn_id)
-            if turn.get("status") in ("completed", "interrupted", "failed"):
-                self.turn_done = turn
-            for req, conn in self.queued_steers:
-                self.send_steer(req.get("text"), conn)
-            self.queued_steers = []
+            for item in turn.get("items") or []:
+                if isinstance(item, dict) and item.get("type") == "agentMessage":
+                    self.add_message(item)
+            if self.turn_id in self.early_done:
+                self.set_done(self.early_done.pop(self.turn_id))
+            elif turn.get("status") in TERMINAL:
+                self.set_done(turn)
+            queued, self.queued_steers = self.queued_steers, []
+            for text, conn in queued:
+                if self.turn_done is not None or c.stop_reason:
+                    reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn has ended or is stopping"})
+                else:
+                    self.send_steer(text, conn)
             return self.wait_turn()
         except Rejected as e:
             die(FAILED, str(e))
         finally:
-            for req, conn in self.queued_steers:
+            for text, conn in self.queued_steers:
                 reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn never started"})
+            for conn, err, _ in self.failed_steers:
+                reply(conn, {"ok": False, "outcome": "not_running", "error": "the turn ended first (%s)" % err})
+            self.queued_steers, self.failed_steers = [], []
 
     def wait_turn(self):
         c = self.ctx
@@ -971,53 +1122,81 @@ class AppServerRun(object):
         while self.turn_done is None:
             if self.eof:
                 die(FAILED, "codex app-server exited before the turn completed: %s" % tail_text(c.stderr_path))
-            if c.stop_reason is None and time.monotonic() >= c.deadline:
+            now = time.monotonic()
+            if c.stop_reason is None and now >= c.deadline:
                 c.stop_reason = "timeout"
+                c.progress("⏱ timed out after %ds; interrupting" % c.timeout)
             if c.stop_reason and stop_deadline is None:
-                if c.stop_reason == "timeout":
-                    c.progress("⏱ timed out after %ds; interrupting" % c.timeout)
                 self.send_interrupt()
-                stop_deadline = time.monotonic() + stop_grace()
-            if stop_deadline is not None and time.monotonic() >= stop_deadline:
+                stop_deadline = now + stop_grace()
+            if stop_deadline is not None and now >= stop_deadline:
+                c.progress("■ the turn did not stop within %ds; killing codex" % stop_grace())
                 break
-            self.step(0.5)
+            self.expire_failed_steers()
+            self.step(0.25)
         return self.finish()
+
+    def final_text(self):
+        msgs = sorted(self.messages.values())
+        finals = [m for m in msgs if m[1] == "final_answer"]
+        if finals:
+            return finals[-1][2]
+        if msgs:
+            return msgs[-1][2]
+        streamed = sorted(v for k, v in self.deltas.items() if k not in self.messages)
+        return streamed[-1][1] if streamed else ""
+
+    def turn_usage(self):
+        mine = [u for t, u in self.usage_log if t == self.turn_id]
+        if not mine:
+            return "in=? cached=? out=? reasoning=? ctx=?"
+        base = None
+        for t, u in self.usage_log:
+            if t == self.turn_id:
+                break
+            base = u
+        total = mine[-1].get("total") or {}
+        btotal = (base or {}).get("total") or ({} if self.ctx.mode == "new" else None)
+
+        def tokens(key):
+            v = total.get(key)
+            if btotal is None or not isinstance(v, int):
+                return "?"
+            b = btotal.get(key, 0)
+            return v - b if isinstance(b, int) else "?"
+        last = mine[-1].get("last") or {}
+        return "in=%s cached=%s out=%s reasoning=%s ctx=%s/%s" % (
+            tokens("inputTokens"), tokens("cachedInputTokens"), tokens("outputTokens"),
+            tokens("reasoningOutputTokens"), last.get("inputTokens", "?"), mine[-1].get("modelContextWindow", "?"))
 
     def finish(self):
         c = self.ctx
         turn = self.turn_done or {}
-        status = turn.get("status") if self.turn_done else "interrupted"
-        finals = [m for m in self.agent_msgs if m[1] == "final_answer"]
-        reply_text = (finals or self.agent_msgs or [(None, None, "")])[-1][2]
-        if not finals and self.agent_msgs and status == "completed":
-            # phase unknown: the answer is the last message, which may have
-            # been printed as commentary; that is fine.
-            pass
-        total = (self.last_usage or {}).get("total") or {}
-        last = (self.last_usage or {}).get("last") or {}
-
-        def turn_tokens(key):
-            v, b = total.get(key), self.base_usage.get(key, 0)
-            return v - b if isinstance(v, int) and isinstance(b, int) else "?"
-        c.usage = "in=%s cached=%s out=%s reasoning=%s ctx=%s/%s" % (
-            turn_tokens("inputTokens"), turn_tokens("cachedInputTokens"), turn_tokens("outputTokens"),
-            turn_tokens("reasoningOutputTokens"), last.get("inputTokens", "?"),
-            (self.last_usage or {}).get("modelContextWindow", "?"))
-        c.retries = self.retries
+        status = turn.get("status") if self.turn_done is not None else "unfinished"
+        text = self.final_text()
+        c.usage, c.retries = self.turn_usage(), self.retries
+        if self.violation:
+            c.progress("✗ stopped: settings changed")
+            return FAILED, text, self.violation
+        if c.stop_reason == "timeout":
+            c.progress("✗ timed out")
+            return TIMEOUT, text, "timed out after %ds. Split the task or raise --timeout" % c.timeout
+        if c.stop_reason in ("signal", "interrupt"):
+            c.progress("■ interrupted")
+            return INTERRUPTED, text, "turn interrupted (%s)" % ("by request" if c.user_interrupt else "by signal")
         if status == "completed":
             c.progress("✓ done")
-            if not reply_text.strip():
-                return EMPTY, reply_text, "codex finished but returned an empty reply"
-            return OK, reply_text, ""
+            if not text.strip():
+                return EMPTY, text, "codex finished but returned an empty reply"
+            return OK, text, ""
         if status == "failed":
             err = (turn.get("error") or {}).get("message") or self.last_error or "turn failed"
             c.progress("✗ failed: %s" % short(err, 200))
-            return FAILED, reply_text, "codex turn failed: %s" % err
-        if c.stop_reason == "timeout":
-            c.progress("✗ timed out")
-            return TIMEOUT, reply_text, "timed out after %ds. Split the task or raise --timeout" % c.timeout
-        c.progress("■ interrupted")
-        return INTERRUPTED, reply_text, "turn interrupted (%s)" % ("by request" if c.user_interrupt else c.stop_reason or "unknown")
+            return FAILED, text, "codex turn failed: %s" % err
+        if status == "interrupted":
+            c.progress("■ interrupted by codex")
+            return INTERRUPTED, text, "turn interrupted by codex"
+        return FAILED, text, "turn ended with unexpected status %r" % status
 
 
 class ExecRun(object):
@@ -1026,38 +1205,46 @@ class ExecRun(object):
     def __init__(self, ctx):
         self.ctx = ctx
         self.inbox = ctx.inbox
+        self.child = None
         self.thread_id = None
         self.completed = False
         self.failed = ""
         self.usage = ""
         self.retries = 0
         self.eof = False
+        self.last = os.path.join(ctx.dir, "last-message.txt")
 
-    def run(self):
+    def spawn(self):
         c = self.ctx
-        last = os.path.join(c.dir, "last-message.txt")
         common = ["--json", "--skip-git-repo-check", "-m", c.model, "-c", 'model_reasoning_effort="%s"' % c.effort,
-                  "-c", 'approval_policy="never"', "-o", last]
+                  "-c", 'approval_policy="never"', "-o", self.last]
         if c.mode == "resume":
             argv = [CODEX, "exec", "resume", c.thread_id] + common + ["-c", 'sandbox_mode="%s"' % c.sandbox, "-"]
         else:
             argv = [CODEX, "exec"] + common + ["-s", c.sandbox, "-"]
-        child = Child(argv, c.cwd, self.inbox, c.stderr_path, stdin_data=c.prompt.encode("utf-8"))
-        c.on_child(child)
+        self.child = Child(argv, c.cwd, self.inbox, c.stderr_path, stdin_data=c.prompt.encode("utf-8"))
+        return self.child
+
+    def run(self):
+        c = self.ctx
+        child = self.child
         c.started_turn(c.thread_id, None)
-        stop_at = None
+        stop_at = hard_end = None
         while not self.eof:
-            if c.stop_reason is None and time.monotonic() >= c.deadline:
+            now = time.monotonic()
+            if c.stop_reason is None and now >= c.deadline:
                 c.stop_reason = "timeout"
             if c.stop_reason and stop_at is None:
                 c.progress("■ stopping (%s)" % c.stop_reason)
                 child.signal_group(signal.SIGINT)
-                stop_at = time.monotonic() + stop_grace()
-            if stop_at is not None and time.monotonic() >= stop_at:
+                stop_at = now + stop_grace()
+            if stop_at is not None and hard_end is None and now >= stop_at:
                 child.signal_group(signal.SIGKILL)
-                stop_at = time.monotonic() + 3600
+                hard_end = now + 5
+            if hard_end is not None and now >= hard_end and child.proc.poll() is not None:
+                break   # a detached descendant may still hold stdout open
             try:
-                kind, data = self.inbox.get(timeout=0.5)
+                kind, data = self.inbox.get(timeout=0.25)
             except queue.Empty:
                 continue
             if kind == "line":
@@ -1072,29 +1259,33 @@ class ExecRun(object):
                 c.stop_reason = c.stop_reason or "signal"
             elif kind == "ctl":
                 req, conn = data
-                if req.get("op") == "interrupt" and req.get("run_id") == c.run_id:
-                    c.user_interrupt = True
-                    c.stop_reason = c.stop_reason or "interrupt"
-                    reply(conn, {"ok": True, "outcome": "interrupt_sent"})
+                if req.get("run_id") != c.run_id:
+                    reply(conn, {"ok": False, "outcome": "rejected", "error": "this socket serves run %s" % c.run_id})
                 elif req.get("op") == "status":
                     reply(conn, {"ok": True, "outcome": "status", "state": c.state, "thread_id": self.thread_id})
+                elif req.get("op") == "interrupt":
+                    if c.stop_reason:
+                        reply(conn, {"ok": False, "outcome": "not_running", "error": "the run is already stopping"})
+                    else:
+                        c.user_interrupt = True
+                        c.stop_reason = "interrupt"
+                        reply(conn, {"ok": True, "outcome": "interrupt_sent"})
                 else:
                     reply(conn, {"ok": False, "outcome": "rejected", "error": "the exec engine cannot steer a running turn"})
         try:
-            child.proc.wait(10)
+            rc = child.proc.wait(10)
         except subprocess.TimeoutExpired:
             child.signal_group(signal.SIGKILL)
-        rc = child.proc.wait()
-        child.stop(1)
+            rc = child.proc.wait()
         c.usage, c.retries = self.usage, self.retries
-        text = read_text(last)
+        text = read_text(self.last)
         if c.stop_reason == "timeout":
             return TIMEOUT, text, "timed out after %ds. Split the task or raise --timeout" % c.timeout
         if c.stop_reason:
-            return INTERRUPTED, text, "turn interrupted (%s)" % ("by request" if c.user_interrupt else c.stop_reason)
+            return INTERRUPTED, text, "turn interrupted (%s)" % ("by request" if c.user_interrupt else "by signal")
         if rc != 0 or self.failed or not self.completed:
             why = self.failed or ("no turn.completed event: %s" % tail_text(c.stderr_path))
-            if rc == -signal.SIGKILL or rc == 137:
+            if rc in (-signal.SIGKILL, 137):
                 why = "killed by SIGKILL (out of memory or external kill). " + why
             return FAILED, text, "codex failed (exit %s): %s" % (rc, why)
         if not self.thread_id or not UUID_RE.match(self.thread_id):
@@ -1297,6 +1488,7 @@ def cmd_send(args, lock_wait=0.0, on_start=None):
     if not tlock.acquire(True, lock_wait):
         die(BUSY, "thread '%s' is already running in this project; steer it, wait for it, or use another thread name" % o["thread"])
     s = resolve_settings(project, o)
+    reap_previous(project, o["thread"])
     prune_runs()
 
     c = RunContext()
@@ -1314,7 +1506,6 @@ def cmd_send(args, lock_wait=0.0, on_start=None):
     c.state = "starting"
     c.stderr_path = os.path.join(c.dir, "stderr.log")
     c.socket = os.path.join(sock_dir(), c.run_id + ".sock")
-    c.started = time.time()
     c.deadline = time.monotonic() + c.timeout
     write_atomic(os.path.join(c.dir, "prompt.txt"), prompt)
     c.events = open(os.path.join(c.dir, "events.jsonl"), "ab", buffering=0)
@@ -1339,19 +1530,15 @@ def cmd_send(args, lock_wait=0.0, on_start=None):
         rec["thread_id"], rec["turn_id"] = tid or rec["thread_id"], turn_id
         save()
 
-    children = []
-    c.registered, c.started_turn, c.on_child = registered, started_turn, children.append
-    save()
-    write_atomic(project.pointer(c.thread), c.run_id + "\n")
-    if on_start:
-        on_start(c.run_id)
+    c.registered, c.started_turn = registered, started_turn
 
     def on_signal(signum, frame):
         c.inbox.put(("signal", signum))
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, on_signal)
 
-    ctl = None
+    runner = AppServerRun(c) if engine == "app-server" else ExecRun(c)
+    child = ctl = None
     code, text, err = FAILED, "", ""
     t0 = time.monotonic()
     try:
@@ -1359,8 +1546,15 @@ def cmd_send(args, lock_wait=0.0, on_start=None):
                                                                c.sandbox, engine))
         if s.get("tightened"):
             c.progress("● sandbox tightened to read-only for this run")
+        # Spawn first: no other thread may exist while the child is forked.
+        child = runner.spawn()
+        rec["worker_pid"], rec["worker_start"] = child.proc.pid, child.start_time
         ctl = ControlServer(c.socket, c.inbox)
-        runner = AppServerRun(c) if engine == "app-server" else ExecRun(c)
+        # Publish the run only once its control socket accepts commands.
+        save()
+        write_atomic(project.pointer(c.thread), c.run_id + "\n")
+        if on_start:
+            on_start(c.run_id)
         code, text, err = runner.run()
     except CctError as e:
         code, err = e.code, e.msg
@@ -1371,9 +1565,9 @@ def cmd_send(args, lock_wait=0.0, on_start=None):
     finally:
         if ctl:
             ctl.close()
-        for ch in children:
-            ch.stop()
-        # Drain commands that arrived at the very end, so no client hangs.
+        if child:
+            child.stop()
+        # Answer commands that arrived at the very end, so no client hangs.
         while True:
             try:
                 kind, data = c.inbox.get_nowait()
@@ -1390,7 +1584,7 @@ def cmd_send(args, lock_wait=0.0, on_start=None):
         except CctError:
             pass
     status_line = "[cct] thread=%s mode=%s id=%s model=%s effort=%s sandbox=%s elapsed=%ds %s retries=%d run=%s log=%s" % (
-        c.thread, c.mode, c.thread_id or "-", c.model, c.effort, c.sandbox, elapsed, c.usage, c.retries,
+        c.thread, c.mode, c.thread_id or "-", c.model, c.effort, c.sandbox, elapsed, c.usage or "", c.retries,
         c.run_id, c.dir)
     write_atomic(os.path.join(c.dir, "reply.txt"), text)
     rec.update(state="done", exit_code=code, error=err, ended=now_utc(), elapsed=elapsed, status_line=status_line)
@@ -1625,13 +1819,17 @@ def cmd_reset(args):
 
 RELAY_DIR = os.path.join(STATE_DIR, "relay")
 DIRECTIVE_RE = re.compile(r"^@cct(\s.*)?$")
+STATE_RE = re.compile(r"^([0-9a-f]{12})\.json$")
 
 
-def relay_paths(state_path):
+def relay_state_path(state_path):
     state_path = os.path.realpath(state_path)
-    if os.path.dirname(state_path) != os.path.realpath(RELAY_DIR) or not state_path.endswith(".json"):
+    m = STATE_RE.match(os.path.basename(state_path))
+    if os.path.dirname(state_path) != os.path.realpath(RELAY_DIR) or not m:
         die(USAGE, "not a relay state file: %s" % state_path)
-    return state_path, state_path[:-5] + ".msg"
+    if not os.path.isfile(state_path):
+        die(USAGE, "relay state file does not exist: %s (run relay-init)" % state_path)
+    return state_path, m.group(1)
 
 
 def parse_directive(line):
@@ -1686,11 +1884,18 @@ def cmd_relay_init(args):
         die(USAGE, "no profile named '%s'" % profile)
     project = Project(opts.get("cd") or os.getcwd())
     ensure_dir(RELAY_DIR)
-    sid = uuid.uuid4().hex[:12]
-    state = os.path.join(RELAY_DIR, sid + ".json")
+    state = os.path.join(RELAY_DIR, uuid.uuid4().hex[:12] + ".json")
     write_json(state, {"profile": profile, "thread": profile, "cd": project.dir, "pending": [], "created": now_utc()})
     print("STATE=%s" % state)
-    print("MSG=%s" % (state[:-5] + ".msg"))
+    return OK
+
+
+def cmd_relay_next(args):
+    """Print a fresh, never-used message path for this relay session."""
+    if len(args) != 1:
+        die(USAGE, "relay-next <state-file>")
+    _, sid = relay_state_path(args[0])
+    print("MSG=%s" % os.path.join(os.path.realpath(RELAY_DIR), "%s-%s.msg" % (sid, uuid.uuid4().hex[:12])))
     return OK
 
 
@@ -1718,18 +1923,22 @@ def relay_note(state, text, code=OK):
 
 
 def cmd_relay(args):
-    """Deliver the relay's message file: start a turn, or steer/interrupt the running one.
+    """Deliver one message file: start a turn, or steer/interrupt the running one.
 
-    Every outcome is queued in the state file, so `relay-result` can report it
+    Every outcome is queued in the state file, so `relay-result` reports it
     exactly once."""
-    if len(args) != 1:
-        die(USAGE, "relay <state-file>")
-    state, msg_path = relay_paths(args[0])
+    if len(args) != 2:
+        die(USAGE, "relay <state-file> <message-file>")
+    state, sid = relay_state_path(args[0])
+    msg_path = os.path.realpath(args[1])
+    if os.path.dirname(msg_path) != os.path.realpath(RELAY_DIR) or \
+            not re.match(r"^%s-[0-9a-f]{12}\.msg$" % sid, os.path.basename(msg_path)):
+        die(USAGE, "not a message file of this relay session: %s (get one with relay-next)" % msg_path)
     try:
         with open(msg_path, "rb") as f:
             raw = f.read()
     except FileNotFoundError:
-        die(USAGE, "no message file %s (write the message there first)" % msg_path)
+        return relay_note(state, "[cct] ERROR: message file %s does not exist (write it first)" % msg_path, USAGE)
     os.unlink(msg_path)
     started = []
     try:
@@ -1778,8 +1987,9 @@ def relay_deliver(state, raw, started):
         return relay_note(state, "[cct] ERROR: interrupt failed: %s" % res.get("error"), FAILED)
     if not text.strip():
         die(USAGE, "message is empty")
-    if live and d.get("new"):
-        die(BUSY, "thread '%s' is running; interrupt it before starting a new thread" % thread)
+    if live and (d.get("new") or d.get("read_only")):
+        die(BUSY, "thread '%s' is running; settings cannot change mid-turn. Send '@cct interrupt' first, "
+                  "then resend this message" % thread)
     if live:
         res = control_request(rec, "steer", text)
         if res.get("ok"):
@@ -1787,7 +1997,7 @@ def relay_deliver(state, raw, started):
                                      "the reply follows when that run ends" % (rec["run_id"], thread))
         if res.get("outcome") != "not_running":
             return relay_note(state, "[cct] ERROR: steering failed and was not resent: %s" % res.get("error"), FAILED)
-        print("[cct] the running turn just ended; starting a new turn instead")
+        print("[cct] the running turn ended before the message arrived; starting a new turn with it")
 
     fd, pfile = tempfile.mkstemp(prefix="prompt-", dir=RELAY_DIR)
     with os.fdopen(fd, "wb") as f:
@@ -1801,10 +2011,6 @@ def relay_deliver(state, raw, started):
     def on_start(run_id):
         started.append(run_id)
         relay_record(state, {"type": "run", "run_id": run_id})
-        try:
-            os.unlink(pfile)
-        except OSError:
-            pass
     try:
         code = cmd_send(sargs, lock_wait=60, on_start=on_start)
     except CctError as e:
@@ -1824,7 +2030,7 @@ def relay_deliver(state, raw, started):
 def cmd_relay_result(args):
     if len(args) != 1:
         die(USAGE, "relay-result <state-file>")
-    state, _ = relay_paths(args[0])
+    state, _ = relay_state_path(args[0])
     lk = relay_lock(state)
     try:
         st = read_json(state)
@@ -1863,7 +2069,8 @@ def cmd_profiles(args):
 COMMANDS = {
     "send": cmd_send, "steer": cmd_steer, "interrupt": cmd_interrupt, "status": cmd_status,
     "result": cmd_result, "watch": cmd_watch, "list": cmd_list, "show": cmd_show, "reset": cmd_reset,
-    "profiles": cmd_profiles, "relay-init": cmd_relay_init, "relay": cmd_relay, "relay-result": cmd_relay_result,
+    "profiles": cmd_profiles, "relay-init": cmd_relay_init, "relay-next": cmd_relay_next, "relay": cmd_relay,
+    "relay-result": cmd_relay_result,
 }
 
 

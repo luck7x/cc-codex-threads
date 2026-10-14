@@ -16,11 +16,11 @@ A Claude Code plugin that runs [OpenAI Codex CLI](https://github.com/openai/code
 
 ## Requirements
 
-`codex` (logged in; tested with codex-cli 0.162.1) and Python 3.8+. Tested on Linux. macOS should work, but process clean-up after a crash relies on the Linux parent-death signal there.
+`codex` (logged in; tested with codex-cli 0.162.1) and Python 3.8+. Tested on Linux. macOS is untested: without /proc a crashed run's worker cannot be identified safely, so a new run on that thread waits instead of killing it.
 
 ## Tests
 
-`tests/run.sh` runs an offline suite (124 checks) against a fake `codex exec` and a fake `codex app-server`, so it makes no API calls. It needs `jq` and `git`.
+`tests/run.sh` runs an offline suite (145 checks) against a fake `codex exec` and a fake `codex app-server`, so it makes no API calls. It needs `jq` and `git`.
 
 ## Install
 

@@ -4,12 +4,14 @@
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 T="$HERE/../plugins/cc-codex-threads/skills/codex-threads/scripts/codex-thread.sh"
-WORK="$(mktemp -d)"; trap 'pkill -f "$WORK" 2>/dev/null; rm -rf -- "$WORK"' EXIT
+WORK="$(mktemp -d)" && [[ -d "$WORK" ]] || { echo "cannot create a temp dir" >&2; exit 1; }
+cleanup() { local p; for p in $(jobs -p); do kill -KILL "$p" 2>/dev/null; done; rm -rf -- "$WORK"; }
+trap cleanup EXIT
 mkdir -p "$WORK/bin" "$WORK/proj" "$WORK/other" "$WORK/dir with space"
 ln -s "$HERE/fake-codex" "$WORK/bin/codex"
 export PATH="$WORK/bin:$PATH" CCT_STATE_DIR="$WORK/state" CCT_PROFILES="$WORK/profiles.json"
 export FAKE_ARGS_LOG="$WORK/args.log" FAKE_STORE="$WORK/store" CCT_SOCK_DIR="$WORK/sock" CCT_STOP_GRACE=3
-unset CCT_ENGINE FAKE_RESUME_OTHERID FAKE_SANDBOX FAKE_IGNORE_INTERRUPT
+unset CCT_ENGINE FAKE_RESUME_OTHERID FAKE_SANDBOX FAKE_IGNORE_INTERRUPT FAKE_SETTINGS_MODEL FAKE_EARLY_USAGE FAKE_STUBBORN
 cd "$WORK/proj" && git init -q . || exit 1
 PROJ_ROOT="$(pwd -P)"
 
@@ -29,12 +31,16 @@ echo "send / resume (app-server)"
 run send luna -- "hello MODE:ok";               expect_rc 0 "new thread from profile"
 check '[[ "$(reg .threads.luna.model)/$(reg .threads.luna.effort)" == gpt-6-luna/max ]]' "profile recorded"
 check '[[ "$OUT" == *"reply from "*": hello MODE:ok"* ]]' "final answer printed"
+check '[[ "$OUT" == *" in=10 "* ]]' "new thread: turn usage from zero" "$OUT"
 check 'lastreq thread/start | jq -e ".params.ephemeral == false and .params.approvalPolicy == \"never\" and .params.sandbox == \"workspace-write\"" >/dev/null' "thread/start is persistent, never asks, sandboxed"
 id1="$(reg .threads.luna.thread_id)"
 run send luna -- "again";                       expect_rc 0 "resume"
 check 'lastreq thread/resume | jq -e --arg id "$id1" ".params.threadId == \$id and .params.excludeTurns == true and .params.model == \"gpt-6-luna\"" >/dev/null' "resume by id with model, without history"
 check 'lastreq turn/start | jq -e ".params.effort == \"max\"" >/dev/null' "effort sent with the turn"
-check '[[ "$(reg .threads.luna.turns)" == 2 ]]' "turn counter"
+check '[[ "$OUT" == *" in=6 "* ]]' "resume: turn usage minus the thread baseline" "$OUT"
+FAKE_EARLY_USAGE=1 run send luna -- "again"
+check '[[ "$OUT" == *" in=6 "* ]]' "baseline before the resume response still counted" "$OUT"
+check '[[ "$(reg .threads.luna.turns)" == 3 ]]' "turn counter (3 turns)"
 run send sol -- "x";                            expect_rc 0 "second thread"
 check '[[ "$(reg .threads.sol.thread_id)" != "$id1" ]]' "threads have distinct sessions"
 run send luna --new -- "fresh";                 expect_rc 0 "--new"
@@ -68,6 +74,11 @@ wait_running luna; rid="$("$T" status luna | jq -r .run_id)"
 run steer sol --run "$rid" -- x;                expect_rc 2 "run id of another thread refused"
 kill -TERM "$bg"; wait "$bg"; RC=$?;            expect_rc 7 "SIGTERM -> graceful interrupt (7)"
 check '"$T" status luna | jq -e ".state == \"done\" and .exit_code == 7" >/dev/null' "run recorded as done"
+FAKE_IGNORE_INTERRUPT=1 "$T" send luna -- "MODE:hang" >/dev/null 2>&1 & bg=$!
+wait_running luna; t0=$SECONDS
+run interrupt luna;                             expect_rc 0 "interrupt a turn that ignores it"
+wait "$bg"; RC=$?;                              expect_rc 7 "ignored interrupt still ends the run (7)"
+check '(( SECONDS - t0 < 20 ))' "within the stop grace, not the run timeout" "took $((SECONDS - t0))s"
 
 echo "concurrency and cleanup"
 for i in $(seq 1 12); do "$T" send "p$i" --profile luna -- "MODE:sleep:1" >/dev/null 2>&1 & done; wait
@@ -81,6 +92,11 @@ kill -KILL "$bg"; wait "$bg" 2>/dev/null; sleep 1
 check '[[ -n "$srv" ]] && ! kill -0 "$srv" 2>/dev/null' "runner SIGKILLed -> app-server exits (no orphan)" "srv=$srv"
 check '"$T" status luna | jq -e ".state == \"lost\" and .alive == false" >/dev/null' "killed run shows as lost"
 run send luna -- "x";                           expect_rc 0 "lock released after runner death"
+FAKE_STUBBORN=1 "$T" send luna -- "MODE:sleep:30" >/dev/null 2>&1 & bg=$!
+wait_running luna; srv="$(pgrep -P "$bg" | head -1)"
+kill -KILL "$bg"; wait "$bg" 2>/dev/null
+CCT_REAP_WAIT=1 run send luna -- "x";          expect_rc 0 "new run after a worker that ignores EOF and SIGTERM"
+check '[[ -n "$srv" ]] && ! kill -0 "$srv" 2>/dev/null' "stubborn old worker was killed before the new run" "srv=$srv"
 run result luna;                                expect_rc 0 "result of the latest run"
 
 echo "failures"
@@ -97,6 +113,12 @@ run send luna --timeout 2 -- "MODE:hang";       expect_rc 5 "timeout -> interrup
 FAKE_IGNORE_INTERRUPT=1 run send luna --timeout 1 -- "MODE:hang"; expect_rc 5 "timeout when the turn ignores interrupt"
 run send luna -- "MODE:crash";                  expect_rc 4 "app-server crash -> 4"
 run send luna -- "MODE:interleave";             expect_rc 0 "server request before turn/start response"
+run send luna -- "MODE:earlydone";              expect_rc 0 "turn completing before the turn/start response"
+check '[[ "$OUT" == *"reply from"* ]]' "early completion keeps the reply"
+run send luna -- "MODE:itemsonly";              expect_rc 0 "answer only inside the completed Turn"
+check '[[ "$OUT" == *"reply from"*"MODE:itemsonly"* ]]' "answer taken from Turn items" "$OUT"
+FAKE_SETTINGS_MODEL=other run send luna -- "MODE:ok"; expect_rc 4 "model changed mid-run -> stopped, 4"
+check '[[ "$ERR" == *"changed the thread settings"* ]]' "settings change explained"
 for k in cmd file perm input elicit tool auth attest legacy unknown; do
   run send luna -- "MODE:request:$k";           expect_rc 0 "server request '$k' answered correctly"
 done
@@ -164,33 +186,46 @@ check '[[ "$W" == *"✓ done"* ]]' "replay shows completion"
 run watch nothere --wait 0;                     expect_rc 2 "watch of unknown thread -> 2"
 
 echo "relay"
-eval "$(cd "$WORK/proj" && "$T" relay-init luna | sed 's/^/R_/')"
-check '[[ -f "$R_STATE" && -n "$R_MSG" ]]' "relay-init prints state and message paths"
-printf '@cct thread=r1 read-only cd="%s"\nfirst task MODE:ok\n$(touch %s/pwned2)' "$WORK/dir with space" "$WORK" > "$R_MSG"
-run relay "$R_STATE";                           expect_rc 0 "relay starts a run"
+R_STATE="$(cd "$WORK/proj" && "$T" relay-init luna | sed -n 's/^STATE=//p')"
+check '[[ -f "$R_STATE" ]]' "relay-init prints the state path"
+next_msg() { "$T" relay-next "$R_STATE" | sed -n 's/^MSG=//p'; }
+M="$(next_msg)"; M2="$(next_msg)"
+check '[[ -n "$M" && "$M" != "$M2" && ! -e "$M" ]]' "relay-next gives fresh, unused paths"
+printf '@cct thread=r1 read-only cd="%s"\nfirst task MODE:ok\n$(touch %s/pwned2)' "$WORK/dir with space" "$WORK" > "$M"
+run relay "$R_STATE" "$M";                      expect_rc 0 "relay starts a run"
 check '[[ "$OUT" == *"✓ done"* && "$OUT" == *"RUN FINISHED (exit 0)"* && ! -e "$WORK/pwned2" ]]' "relay output has progress, no shell expansion"
-check '[[ ! -e "$R_MSG" ]]' "message file consumed"
+check '[[ ! -e "$M" ]]' "message file consumed"
 run relay-result "$R_STATE";                    expect_rc 0 "relay-result"
 check '[[ "$OUT" == *"first task MODE:ok"* && "$OUT" != *"@cct"* && "$OUT" != *"✓ done"* ]]' "relay-result is the reply without directive or progress" "$OUT"
 run relay-result "$R_STATE"
 check '[[ "$OUT" == *"nothing new"* ]]' "each result reported once"
 check '[[ "$(jq -r .threads.r1.sandbox "$CCT_STATE_DIR"/projects/*.json | grep -v null)" == read-only ]]' "directive: thread, read-only and cd with spaces applied"
-printf 'MODE:sleep:20' > "$R_MSG"; "$T" relay "$R_STATE" > "$WORK/r1" 2>&1 & bg=$!
+M="$(next_msg)"; printf 'MODE:sleep:20' > "$M"; "$T" relay "$R_STATE" "$M" > "$WORK/r1" 2>&1 & bg=$!
 for i in $(seq 1 50); do grep -q "turn started" "$WORK/r1" && break; sleep 0.1; done
-printf 'please change course' > "$R_MSG"; run relay "$R_STATE"
+M="$(next_msg)"; printf 'please change course' > "$M"
+M2="$(next_msg)"; printf 'second quick follow-up' > "$M2"
+run relay "$R_STATE" "$M"
 check '[[ "$OUT" == *"steering input"* ]]' "message during a run becomes steering"
+check '[[ -e "$M2" ]]' "a follow-up written meanwhile is untouched"
 wait "$bg"
 run relay-result "$R_STATE"
 check '[[ "$OUT" == *"steering input"* && "$OUT" == *"STEERED: please change course"* ]]' "steer note and final reply both reported" "$OUT"
-printf 'MODE:sleep:20' > "$R_MSG"; "$T" relay "$R_STATE" > "$WORK/r2" 2>&1 & bg=$!
+run relay "$R_STATE" "$M2";                     expect_rc 0 "the second follow-up is delivered too"
+check '[[ "$OUT" == *"second quick follow-up"* ]]' "no message lost" "$OUT"
+"$T" relay-result "$R_STATE" >/dev/null
+M="$(next_msg)"; printf 'MODE:sleep:20' > "$M"; "$T" relay "$R_STATE" "$M" > "$WORK/r2" 2>&1 & bg=$!
 for i in $(seq 1 50); do grep -q "turn started" "$WORK/r2" && break; sleep 0.1; done
-printf '@cct interrupt\n' > "$R_MSG"; run relay "$R_STATE"
+M="$(next_msg)"; printf '@cct read-only\nlook but do not touch' > "$M"; run relay "$R_STATE" "$M"
+expect_rc 3 "read-only while a writable turn runs is refused"
+check '! grep -q "look but do not touch" "$FAKE_ARGS_LOG"' "and is not smuggled in as steering"
+M="$(next_msg)"; printf '@cct interrupt\n' > "$M"; run relay "$R_STATE" "$M"
 check '[[ "$OUT" == *"interrupt sent"* ]]' "@cct interrupt"
 wait "$bg"; RC=$?;                              expect_rc 7 "interrupted relay run -> 7"
-printf '@cct bogus\nx' > "$R_MSG"; run relay "$R_STATE"; expect_rc 2 "unknown directive rejected"
+M="$(next_msg)"; printf '@cct bogus\nx' > "$M"; run relay "$R_STATE" "$M"; expect_rc 2 "unknown directive rejected"
 run relay-result "$R_STATE"
-check '[[ "$OUT" == *"unknown @cct directive"* ]]' "rejection is reported through relay-result"
-run relay /etc/passwd;                          expect_rc 2 "relay refuses foreign state files"
+check '[[ "$OUT" == *"refused"* || "$OUT" == *"settings cannot change"* ]] && [[ "$OUT" == *"unknown @cct directive"* ]]' "rejections are reported through relay-result" "$OUT"
+run relay "$R_STATE" "$WORK/elsewhere.msg";     expect_rc 2 "relay refuses message files outside its session"
+run relay /etc/passwd "$M";                     expect_rc 2 "relay refuses foreign state files"
 
 echo "exec engine"
 export CCT_ENGINE=exec
