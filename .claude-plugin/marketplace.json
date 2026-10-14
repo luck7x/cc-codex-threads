@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cc-codex-threads",
+  "description": "Run OpenAI Codex CLI from Claude Code as named, resumable worker threads",
+  "owner": { "name": "luck7x", "url": "https://github.com/luck7x" },
+  "plugins": [
+    {
+      "name": "cc-codex-threads",
+      "source": "./plugins/cc-codex-threads",
+      "description": "Named, resumable Codex worker threads (e.g. luna for fast execution, sol for harder work), resumed by session id",
+      "version": "1.0.0",
+      "category": "development",
+      "homepage": "https://github.com/luck7x/cc-codex-threads",
+      "tags": ["codex", "subagent", "delegation", "threads"]
+    }
+  ]
+}

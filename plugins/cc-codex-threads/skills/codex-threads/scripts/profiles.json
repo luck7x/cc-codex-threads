@@ -1,0 +1,4 @@
+{
+  "luna": { "model": "gpt-6-luna",  "effort": "max",   "sandbox": "workspace-write" },
+  "sol":  { "model": "gpt-6.1-sol", "effort": "xhigh", "sandbox": "workspace-write" }
+}
